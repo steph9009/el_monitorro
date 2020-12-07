@@ -3,6 +3,7 @@ use crate::bot::logic::{DeleteSubscriptionError, SubscriptionError};
 use crate::db;
 use crate::db::telegram::NewTelegramChat;
 use futures::StreamExt;
+use once_cell::sync::OnceCell;
 use std::env;
 use telegram_bot::prelude::*;
 use telegram_bot::{
@@ -21,6 +22,7 @@ static GET_GLOBAL_TEMPLATE: &str = "/get_global_template";
 static UNSUBSCRIBE: &str = "/unsubscribe";
 static HELP: &str = "/help";
 static START: &str = "/start";
+static OWNER_TELEGRAM_ID: OnceCell<Option<i64>> = OnceCell::new();
 
 static COMMANDS: [&str; 11] = [
     SUBSCRIBE,
@@ -118,7 +120,13 @@ fn commands_string() -> String {
 }
 
 async fn help(api: Api, message: MessageOrChannelPost) -> Result<(), Error> {
-    let response = commands_string();
+    let response_help = commands_string();
+
+    let response = format!(
+        "{}\n\
+        If you still have questions please join https://t.me/el_monitorro or contact the author (@Ayrat555)\n",
+        response_help
+    );
 
     api.send(message.text_reply(response)).await?;
     Ok(())
@@ -134,7 +142,7 @@ async fn start(api: Api, message: MessageOrChannelPost) -> Result<(), Error> {
          When you subscribe to a new feed, you'll receive 10 last messages from it. After that, you'll start receiving only new feed items.\n\
          Feed updates check interval is 1 minute. Unread items delivery interval is also 1 minute.\n\
          Currently, the number of subscriptions is limited to {}.\n\n\
-         Contact @Ayrat555 with your feedback, suggestions, found bugs, etc. The bot is open source. You can find it at https://github.com/ayrat555/el_monitorro\n\n\
+         Join https://t.me/el_monitorro or contact the author (@Ayrat555) with your feedback, suggestions, found bugs, etc. The bot is open source. You can find it at https://github.com/ayrat555/el_monitorro\n\n\
          Unlike other similar projects, El Monitorro is completely open and it's free of charge. I develop it in my free time and pay for hosting myself. Consider donating to the project - https://paypal.me/ayrat555",
         commands_string(),
         logic::sub_limit()
@@ -296,14 +304,6 @@ fn process_message(api: Api, orig_message: Message) {
             let command = data.clone();
             let message = MessageOrChannelPost::Message(orig_message.clone());
 
-            let is_known_command = COMMANDS
-                .iter()
-                .any(|command_name| command.contains(command_name));
-
-            if is_known_command {
-                log::info!("{:?} wrote: {}", get_chat_id(&message), command);
-            }
-
             tokio::spawn(process_message_or_channel_post(api, message, command));
         }
         _ => (),
@@ -325,12 +325,37 @@ fn process_channel_post(api: Api, post: ChannelPost) {
     };
 }
 
+fn owner_telegram_id() -> &'static Option<i64> {
+    OWNER_TELEGRAM_ID.get_or_init(|| match env::var("OWNER_TELEGRAM_ID") {
+        Ok(val) => {
+            let parsed_value: i64 = val.parse().unwrap();
+            Some(parsed_value)
+        }
+        Err(_error) => None,
+    })
+}
+
 async fn process_message_or_channel_post(
     api: Api,
     message: MessageOrChannelPost,
     command_string: String,
 ) -> Result<(), Error> {
     let command = &command_string;
+    let chat_id = get_chat_id(&message);
+
+    if let Some(id) = owner_telegram_id() {
+        if *id != chat_id {
+            return Ok(());
+        }
+    }
+
+    let is_known_command = COMMANDS
+        .iter()
+        .any(|command_name| command.contains(command_name));
+
+    if is_known_command {
+        log::info!("{:?} wrote: {}", chat_id, command);
+    }
 
     if command.starts_with(SUBSCRIBE) {
         let argument = parse_argument(command, SUBSCRIBE);

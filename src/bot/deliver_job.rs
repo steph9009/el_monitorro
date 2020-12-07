@@ -4,9 +4,11 @@ use crate::db::feeds;
 use crate::db::telegram;
 use crate::models::feed::Feed;
 use crate::models::feed_item::FeedItem;
+use crate::models::telegram_chat::TelegramChat;
 use crate::models::telegram_subscription::TelegramSubscription;
 use chrono::offset::FixedOffset;
 use chrono::{DateTime, Utc};
+use diesel::pg::PgConnection;
 use diesel::result::Error;
 use handlebars::{to_json, Handlebars};
 use html2text::from_read;
@@ -29,6 +31,7 @@ static DISCRIPTION_LIMIT: usize = 3500;
 
 pub struct DeliverJob {}
 
+#[derive(Debug)]
 pub struct DeliverJobError {
     pub msg: String,
 }
@@ -49,39 +52,62 @@ impl DeliverJob {
     pub async fn execute(&self) -> Result<(), DeliverJobError> {
         let semaphored_connection = db::get_semaphored_connection().await;
         let db_connection = semaphored_connection.connection;
-        let mut current_subscriptions: Vec<TelegramSubscription>;
+        let mut current_chats: Vec<i64>;
         let mut page = 1;
-        let mut total_number = 0;
+        let mut total_chat_number = 0;
+        let mut total_subscription_number = 0;
 
         log::info!("Started delivering feed items");
 
         loop {
-            current_subscriptions = telegram::fetch_subscriptions(&db_connection, page, 1000)?;
+            current_chats = telegram::fetch_chats_with_subscriptions(&db_connection, page, 1000)?;
 
             page += 1;
 
-            if current_subscriptions.is_empty() {
+            if current_chats.is_empty() {
                 break;
             }
 
-            total_number += current_subscriptions.len();
+            total_chat_number += current_chats.len();
 
-            for subscription in current_subscriptions {
-                tokio::spawn(deliver_subscription_updates(subscription));
+            for chat_id in current_chats {
+                let subscriptions = telegram::find_subscriptions_for_chat(&db_connection, chat_id)?;
+
+                total_subscription_number += subscriptions.len();
+
+                tokio::spawn(deliver_updates_for_chat(subscriptions));
             }
         }
 
         log::info!(
-            "Started checking delivery for {} subscriptions",
-            total_number
+            "Started checking delivery for {} chats and {} subscriptions",
+            total_chat_number,
+            total_subscription_number
         );
 
         Ok(())
     }
 }
 
+async fn deliver_updates_for_chat(
+    telegram_subscriptions: Vec<TelegramSubscription>,
+) -> Result<(), DeliverJobError> {
+    for subscription in telegram_subscriptions {
+        match deliver_subscription_updates(&subscription).await {
+            Ok(()) => (),
+            Err(error) => log::error!(
+                "Failed to deliver updates for subscription: {:?} {:?}",
+                subscription,
+                error
+            ),
+        }
+    }
+
+    Ok(())
+}
+
 async fn deliver_subscription_updates(
-    subscription: TelegramSubscription,
+    subscription: &TelegramSubscription,
 ) -> Result<(), DeliverJobError> {
     let semaphored_connection = db::get_semaphored_connection().await;
     let connection = semaphored_connection.connection;
@@ -89,6 +115,9 @@ async fn deliver_subscription_updates(
     let undelivered_count = telegram::count_undelivered_feed_items(&connection, &subscription);
     let chat_id = subscription.chat_id;
     let feed = feeds::find(&connection, subscription.feed_id).unwrap();
+
+    let chat = telegram::find_chat(&connection, chat_id).unwrap();
+    let delay = delay_period(&chat);
 
     if feed_items.len() < undelivered_count as usize {
         let message = format!(
@@ -99,7 +128,10 @@ async fn deliver_subscription_updates(
         );
 
         match api::send_message(chat_id, message).await {
-            Ok(_) => (),
+            Ok(_) => {
+                time::delay_for(delay).await;
+                ()
+            }
             Err(error) => {
                 let error_message = format!("{}", error);
 
@@ -120,8 +152,6 @@ async fn deliver_subscription_updates(
     }
 
     if !feed_items.is_empty() {
-        let chat = telegram::find_chat(&connection, chat_id).unwrap();
-
         let offset = match chat.utc_offset_minutes {
             None => FixedOffset::west(0),
             Some(value) => {
@@ -141,11 +171,13 @@ async fn deliver_subscription_updates(
         let mut messages = format_messages(template, offset, feed_items.clone(), feed);
         messages.reverse();
 
-        for message in messages {
-            time::delay_for(Duration::from_millis(250)).await;
-
+        for (message, publication_date) in messages {
             match api::send_message(chat_id, message).await {
-                Ok(_) => (),
+                Ok(_) => {
+                    time::delay_for(delay).await;
+                    update_last_deivered_at(&connection, &subscription, publication_date)?;
+                    ()
+                }
                 Err(error) => {
                     let error_message = format!("{}", error);
 
@@ -164,23 +196,25 @@ async fn deliver_subscription_updates(
                 }
             };
         }
-
-        match telegram::set_subscription_last_delivered_at(
-            &connection,
-            &subscription,
-            get_max_publication_date(feed_items),
-        ) {
-            Ok(_) => (),
-            Err(error) => {
-                log::error!("Failed to set last_delivered_at: {}", error);
-                return Err(DeliverJobError {
-                    msg: format!("Failed to set last_delivered_at : {}", error),
-                });
-            }
-        }
     }
 
     Ok(())
+}
+
+fn update_last_deivered_at(
+    connection: &PgConnection,
+    subscription: &TelegramSubscription,
+    publication_date: DateTime<Utc>,
+) -> Result<(), DeliverJobError> {
+    match telegram::set_subscription_last_delivered_at(connection, subscription, publication_date) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            log::error!("Failed to set last_delivered_at: {}", error);
+            return Err(DeliverJobError {
+                msg: format!("Failed to set last_delivered_at : {}", error),
+            });
+        }
+    }
 }
 
 fn format_messages(
@@ -188,7 +222,7 @@ fn format_messages(
     date_offset: FixedOffset,
     feed_items: Vec<FeedItem>,
     feed: Feed,
-) -> Vec<String> {
+) -> Vec<(String, DateTime<Utc>)> {
     let mut data = Map::new();
 
     let templ = match template {
@@ -238,18 +272,24 @@ fn format_messages(
             match reg.render_template(&templ, &data) {
                 Err(error) => {
                     log::error!("Failed to render template {:?}", error);
-                    "Failed to render a message".to_string()
+                    (
+                        "Failed to render a message".to_string(),
+                        item.publication_date,
+                    )
                 }
                 Ok(result) => match decode_html(&result) {
                     Err(error) => {
                         log::error!("Failed to render template {:?}", error);
-                        "Failed to render a message".to_string()
+                        (
+                            "Failed to render a message".to_string(),
+                            item.publication_date,
+                        )
                     }
-                    Ok(string) => string,
+                    Ok(string) => (string, item.publication_date),
                 },
             }
         })
-        .collect::<Vec<String>>()
+        .collect::<Vec<(String, DateTime<Utc>)>>()
 }
 
 fn remove_html(string: String) -> String {
@@ -281,12 +321,11 @@ fn bot_blocked(error_message: &str) -> bool {
         || error_message.contains(CHAT_UPGRADED_ERROR)
 }
 
-fn get_max_publication_date(items: Vec<FeedItem>) -> DateTime<Utc> {
-    items
-        .into_iter()
-        .max_by(|item1, item2| item1.publication_date.cmp(&item2.publication_date))
-        .unwrap()
-        .publication_date
+fn delay_period(chat: &TelegramChat) -> Duration {
+    match chat.kind.as_str() {
+        "group" | "supergroup" => Duration::from_millis(2200),
+        _ => Duration::from_millis(35),
+    }
 }
 
 #[cfg(test)]
@@ -298,49 +337,11 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     #[test]
-    fn get_max_publication_date_finds_max_publication_date_in_feed_items_vector() {
-        let feed_item1 = FeedItem {
-            feed_id: 1,
-            title: "".to_string(),
-            description: None,
-            link: "dsd".to_string(),
-            author: None,
-            guid: None,
-            publication_date: DateTime::parse_from_rfc2822("Wed, 13 May 2020 15:54:02 EDT")
-                .unwrap()
-                .into(),
-            created_at: db::current_time(),
-            updated_at: db::current_time(),
-        };
-
-        let feed_item2 = FeedItem {
-            feed_id: 1,
-            title: "".to_string(),
-            description: None,
-            link: "dsd1".to_string(),
-            author: None,
-            guid: None,
-
-            publication_date: DateTime::parse_from_rfc2822("Wed, 13 May 2020 13:54:02 EDT")
-                .unwrap()
-                .into(),
-            created_at: db::current_time(),
-            updated_at: db::current_time(),
-        };
-
-        let feed_items = vec![feed_item1, feed_item2];
-        let result = super::get_max_publication_date(feed_items);
-
-        let expected_result: DateTime<Utc> =
+    fn format_messages_uses_default_template_if_custom_template_is_missing() {
+        let publication_date: DateTime<Utc> =
             DateTime::parse_from_rfc2822("Wed, 13 May 2020 15:54:02 EDT")
                 .unwrap()
                 .into();
-
-        assert!(result == expected_result);
-    }
-
-    #[test]
-    fn format_messages_uses_default_template_if_custom_template_is_missing() {
         let feed_items = vec![FeedItem {
             feed_id: 1,
             title: "Title".to_string(),
@@ -348,9 +349,7 @@ mod tests {
             link: "dsd".to_string(),
             author: None,
             guid: None,
-            publication_date: DateTime::parse_from_rfc2822("Wed, 13 May 2020 15:54:02 EDT")
-                .unwrap()
-                .into(),
+            publication_date: publication_date.clone(),
             created_at: db::current_time(),
             updated_at: db::current_time(),
         }];
@@ -369,13 +368,19 @@ mod tests {
         let result = super::format_messages(None, FixedOffset::east(5 * 60), feed_items, feed);
 
         assert_eq!(
-            result[0],
+            result[0].0,
             "FeedTitle\n\nTitle\n\n2020-05-13 19:59:02 +00:05\n\ndsd\n\n".to_string()
         );
+
+        assert_eq!(result[0].1, publication_date);
     }
 
     #[test]
     fn format_messages_uses_custom_template() {
+        let publication_date: DateTime<Utc> =
+            DateTime::parse_from_rfc2822("Wed, 13 May 2020 15:54:02 EDT")
+                .unwrap()
+                .into();
         let feed_items = vec![FeedItem {
             feed_id: 1,
             title: "Title".to_string(),
@@ -383,12 +388,11 @@ mod tests {
             link: "dsd".to_string(),
             author: None,
             guid: None,
-            publication_date: DateTime::parse_from_rfc2822("Wed, 13 May 2020 15:54:02 EDT")
-                .unwrap()
-                .into(),
+            publication_date: publication_date.clone(),
             created_at: db::current_time(),
             updated_at: db::current_time(),
         }];
+
         let feed = Feed {
             id: 1,
             title: Some("FeedTitle".to_string()),
@@ -404,8 +408,10 @@ mod tests {
         let result = super::format_messages(Some("{{bot_feed_name}} {{bot_feed_link}} {{bot_date}} {{bot_item_link}} {{bot_item_description}} {{bot_item_name}} {{bot_item_name}}".to_string()), FixedOffset::east(600 * 60), feed_items, feed);
 
         assert_eq!(
-            result[0],
+            result[0].0,
             "FeedTitle link 2020-05-14 05:54:02 +10:00 dsd Description Title Title".to_string()
         );
+
+        assert_eq!(result[0].1, publication_date);
     }
 }
